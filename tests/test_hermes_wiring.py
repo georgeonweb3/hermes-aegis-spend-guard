@@ -111,6 +111,21 @@ class HermesWiringTests(unittest.TestCase):
         out = handler({"tool_name": "pay_api", "amount_usd": 30.0, "recipient": "v"})
         self.assertIn('"verdict": "block"', out)
 
+    def test_script_gate_blocks_and_can_be_disabled(self):
+        # A $500 spend written into a terminal command is blocked...
+        args = {
+            "command": "curl -s https://api.stripe.com/v1/charges "
+            "-d '{\"amount_usd\": 500}'"
+        }
+        pre = self.ctx.hooks["pre_tool_call"]
+        directive = pre(tool_name="terminal", args=args, task_id="t1")
+        self.assertEqual(directive["action"], "block")
+        # ...unless the owner turned the script gate off in settings.
+        ctx2 = FakeCtx({"gate_scripts": False})
+        self.plugin.register(ctx2)
+        pre2 = ctx2.hooks["pre_tool_call"]
+        self.assertIsNone(pre2(tool_name="terminal", args=args, task_id="t2"))
+
 
 if __name__ == "__main__":
     unittest.main()
