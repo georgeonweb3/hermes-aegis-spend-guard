@@ -1,5 +1,7 @@
 # Aegis Spend Guard
 
+> **Status:** live and merged, including the script gate (Nov 10, 2026) — spends hidden inside shell commands are scanned, priced and capped too. Catalog PR: NousResearch/hermes-agent#151917.
+
 **Owner-set spend policy for Hermes Agent, enforced before any spend executes.**
 
 AI agents with paid tools can spend real money on their own initiative. Hermes
