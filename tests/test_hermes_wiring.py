@@ -111,6 +111,29 @@ class HermesWiringTests(unittest.TestCase):
         out = handler({"tool_name": "pay_api", "amount_usd": 30.0, "recipient": "v"})
         self.assertIn('"verdict": "block"', out)
 
+    def test_own_tools_are_skipped_by_both_hooks(self):
+        # The plugin's own tools must never be vetoed by the pre hook
+        # (a spend_guard_check dry run asks ABOUT a spend; with these
+        # args it would otherwise be blocked as a $500 spend) and never
+        # recorded by the post hook (neither tool moves money).
+        pre = self.ctx.hooks["pre_tool_call"]
+        post = self.ctx.hooks["post_tool_call"]
+        spendy_args = {"amount_usd": 500.0, "recipient": "vendor.example"}
+        for own_tool in ("spend_guard_check", "spend_guard_status"):
+            with self.subTest(tool=own_tool):
+                self.assertIsNone(
+                    pre(tool_name=own_tool, args=spendy_args, task_id="t1")
+                )
+                post(
+                    tool_name=own_tool,
+                    args=spendy_args,
+                    result="ok",
+                    task_id="t1",
+                    duration_ms=1,
+                )
+        status = self.plugin._tool_spend_guard_status()
+        self.assertIn('"spent_today_usd": 0.0', status)
+
     def test_script_gate_blocks_and_can_be_disabled(self):
         # A $500 spend written into a terminal command is blocked...
         args = {

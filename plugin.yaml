@@ -41,6 +41,10 @@ config_schema:
     type: dict
     default: {}
     description: "Fixed per-call prices in USD for tools that charge per call, e.g. {some_paid_tool: 0.50}. Calls to these tools are treated as spends at that price."
+  spend_tools:
+    type: list
+    default: []
+    description: "Owner-set list of tools whose amount/value/price arguments are treated as spends and checked against policy. Tools not in this list, paid_tools or allowed_tools, and whose names do not lead with a spend verb, are never treated as spends, so unrelated tools (scrolls, form values, previews) are never blocked or counted in the daily ledger."
   gate_scripts:
     type: bool
     default: true

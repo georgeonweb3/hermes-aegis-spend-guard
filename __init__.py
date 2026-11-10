@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 _guard: SpendGuard | None = None
 
+# The plugin's own tools. Both hooks skip them: a spend_guard_check dry
+# run must never be vetoed by the guard it is asking about, and neither
+# tool moves money, so neither may ever be recorded as a spend. (The
+# tools' handlers call the guard directly, not through the hooks, so
+# skipping here does not blind them.)
+SELF_TOOLS = frozenset({"spend_guard_check", "spend_guard_status"})
+
 
 class _CtxStateStorage:
     """Adapt ctx.state (keyword ``default=``) to the guard's storage API."""
@@ -76,6 +83,11 @@ def _build_guard(ctx) -> SpendGuard:
     paid_tools = {
         str(name): _usd_to_cents(price, 0) for name, price in dict(paid_tools_raw).items()
     }
+    # Owner-declared spend tools: arg-key amounts on these count as money
+    # even when the tool's name carries no spend verb. Together with
+    # paid_tools and allowed_tools this scopes arg-based spend detection;
+    # amount-shaped arguments on every other tool are ignored.
+    spend_tools = [str(name) for name in (get("spend_tools", default=[]) or [])]
     try:
         storage = _CtxStateStorage(ctx.state)
     except Exception:
@@ -85,13 +97,14 @@ def _build_guard(ctx) -> SpendGuard:
         storage,
         paid_tools=paid_tools,
         gate_scripts=bool(get("gate_scripts", default=True)),
+        spend_tools=spend_tools,
     )
 
 
 # ---------------------------------------------------------------- hooks
 def _on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
     """Evaluate a tool call before it executes. Fail closed on spends."""
-    if _guard is None or not tool_name:
+    if _guard is None or not tool_name or tool_name in SELF_TOOLS:
         return None
     try:
         directive, _ev = _guard.evaluate_call(tool_name, args or {})
@@ -110,6 +123,8 @@ def _on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
                 args or {},
                 _guard.paid_tools,
                 gate_scripts=getattr(_guard, "gate_scripts", True),
+                spend_tools=getattr(_guard, "spend_tools", []),
+                allowed_tools=_guard.policy.allowed_tools,
             ) is not None:
                 return {
                     "action": "block",
@@ -123,7 +138,7 @@ def _on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
 
 def _on_post_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
     """Record executed spends in the daily ledger."""
-    if _guard is None or not tool_name:
+    if _guard is None or not tool_name or tool_name in SELF_TOOLS:
         return None
     try:
         _guard.record_execution(tool_name, args or {})
@@ -173,6 +188,7 @@ def _tool_spend_guard_status(args: dict | None = None, **kwargs) -> str:
             "allowlist": p.allowlist,
             "blocklist": p.blocklist,
             "allowed_tools": p.allowed_tools,
+            "spend_tools": _guard.spend_tools,
             "unknown_recipient": p.unknown_recipient,
             "gate_scripts": _guard.gate_scripts,
         }

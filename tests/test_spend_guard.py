@@ -16,13 +16,14 @@ from policy import BLOCK, WARN, GuardPolicy, SpendAction, evaluate  # noqa: E402
 FIXED_NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
 
 
-def make_guard(policy=None, storage=None, paid_tools=None, gate_scripts=True):
+def make_guard(policy=None, storage=None, paid_tools=None, gate_scripts=True, spend_tools=None):
     return SpendGuard(
         policy or GuardPolicy(),
         storage if storage is not None else DictStorage(),
         paid_tools=paid_tools or {},
         clock=lambda: FIXED_NOW,
         gate_scripts=gate_scripts,
+        spend_tools=spend_tools or [],
     )
 
 
@@ -255,6 +256,104 @@ class ScriptGateTests(unittest.TestCase):
             "run_notebook_cell", {"code": "charge_card(amount=30)"}, {}
         )
         self.assertEqual(action.amount_cents, 3000)
+
+
+class SpendDetectionScopingTests(unittest.TestCase):
+    """Arg-key amounts are money ONLY on spend tools (owner-listed or
+    spend-named). Core tools that happen to carry amount/value-shaped
+    arguments — the maintainer's review cases — must pass untouched:
+    no directive, no evaluation, nothing in the daily ledger."""
+
+    def assert_not_a_spend(self, guard, tool_name, args):
+        self.assertIsNone(
+            extract_spend(
+                tool_name,
+                args,
+                guard.paid_tools,
+                spend_tools=guard.spend_tools,
+                allowed_tools=guard.policy.allowed_tools,
+            )
+        )
+        directive, ev = guard.evaluate_call(tool_name, args)
+        self.assertIsNone(directive)
+        self.assertIsNone(ev)
+        guard.record_execution(tool_name, args)
+        self.assertEqual(guard.spent_today_cents(), 0)
+
+    def test_computer_use_set_value_text_is_not_a_spend(self):
+        # computer_use setting a form field to "Blue": the value parses
+        # to 0 and used to be BLOCKED as a non-positive spend.
+        guard = make_guard()
+        self.assert_not_a_spend(
+            guard, "computer_use", {"action": "set_value", "value": "Blue"}
+        )
+
+    def test_scroll_amount_is_not_a_spend(self):
+        # A scroll amount is a distance (3 lines/clicks), not $3.
+        guard = make_guard()
+        self.assert_not_a_spend(guard, "computer_use", {"action": "scroll", "amount": 3})
+        self.assert_not_a_spend(guard, "scroll", {"amount": 3})
+
+    def test_drive_preview_negative_scroll_amount_is_not_a_spend(self):
+        # drive_preview scroll amounts can be negative; they used to
+        # enter the ledger path as negative spends.
+        guard = make_guard()
+        self.assert_not_a_spend(guard, "drive_preview", {"amount": -240})
+
+    def test_unlisted_tool_amount_keys_are_ignored(self):
+        guard = make_guard()
+        self.assert_not_a_spend(guard, "weather_lookup", {"price": 99999, "total": 5})
+
+    def test_show_tip_is_not_routed_to_approval(self):
+        # "tip" sits in noun position: the tool displays a tip, it does
+        # not send one. Segment matching must not gate it.
+        guard = make_guard()
+        directive, ev = guard.evaluate_call("show_tip", {})
+        self.assertIsNone(directive)
+        self.assertIsNone(ev)
+        self.assert_not_a_spend(guard, "show_tip", {"value": "Thanks for reading"})
+
+    def test_hint_substrings_do_not_match(self):
+        guard = make_guard()
+        self.assert_not_a_spend(guard, "tooltips", {})
+
+    def test_spend_named_tool_amounts_still_count(self):
+        # Genuine spend tools keep the old behaviour end to end.
+        guard = make_guard()
+        directive, ev = guard.evaluate_call(
+            "pay_api", {"amount_usd": 30.00, "recipient": "vendor.example"}
+        )
+        self.assertEqual(directive["action"], "block")
+        self.assertEqual(ev.verdict, BLOCK)
+
+    def test_owner_spend_tools_list_scopes_detection(self):
+        # A tool with no spend verb in its name counts once the owner
+        # lists it in spend_tools...
+        guard = make_guard(spend_tools=["invoice_runner"])
+        directive, ev = guard.evaluate_call(
+            "invoice_runner", {"amount_usd": 30.00, "recipient": "vendor.example"}
+        )
+        self.assertEqual(directive["action"], "block")
+        self.assertEqual(ev.verdict, BLOCK)
+        # ...and an amount-less call to it is an unpriced spend, gated.
+        directive, ev = guard.evaluate_call("invoice_runner", {})
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(ev.verdict, WARN)
+        # The same tool is invisible to a guard whose owner did not list it.
+        self.assert_not_a_spend(
+            make_guard(), "invoice_runner", {"amount_usd": 30.00}
+        )
+
+    def test_allowed_tools_scope_detection(self):
+        # allowed_tools membership also qualifies a tool for arg-based
+        # detection (its amounts are then policy-checked as spends).
+        guard = make_guard(GuardPolicy(allowed_tools=["ledger_entry"]))
+        directive, ev = guard.evaluate_call(
+            "ledger_entry", {"amount_usd": 5.00, "recipient": "vendor.example"}
+        )
+        self.assertIsNone(directive)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.verdict, "allow")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,13 @@ Responsibilities:
 * Decide whether a tool call is a *spend* and extract (tool, recipient,
   amount) from its arguments:
     - an explicit amount in the args (``amount_cents`` / ``amount_usd`` /
-      ``amount`` / ``price`` / ``cost`` / ``total`` ...), or
+      ``amount`` / ``price`` / ``cost`` / ``total`` ...) — read ONLY on
+      spend tools: tools the owner listed (``allowed_tools`` /
+      ``paid_tools`` / ``spend_tools``) or whose name leads with a spend
+      verb as a whole segment. The same keys on unrelated tools are not
+      money: a scroll ``amount: 3`` is three lines, a form ``value:
+      "Blue"`` is text, a preview's negative scroll amount is not a
+      negative spend polluting the ledger, or
     - a fixed per-call price from the owner's ``paid_tools`` map, or
     - a spend written into command/script text (a ``command`` / ``cmd`` /
       ``script`` / ``code`` argument — e.g. a ``terminal`` call): a money
@@ -71,6 +77,43 @@ SPEND_TOOL_HINTS = (
     "subscribe",
     "charge",
 )
+
+
+def _name_segments(tool_name: str) -> list[str]:
+    """The tool name split into segments on ``_``, ``-`` and ``.``."""
+    return [seg for seg in re.split(r"[_\-.]+", str(tool_name).lower()) if seg]
+
+
+def _has_spend_hint(tool_name: str) -> bool:
+    """True when the tool's name *leads* with a spend verb as a whole segment.
+
+    Segment matching, not substring matching: ``pay_api`` and
+    ``transfer_tokens`` are spend-shaped, but ``show_tip`` merely displays
+    a tip and ``tooltips`` is a UI widget — a hint only counts in the
+    leading (verb) segment of the name, never as a substring of another
+    word and never in noun position.
+    """
+    segments = _name_segments(tool_name)
+    return bool(segments) and segments[0] in SPEND_TOOL_HINTS
+
+
+def _is_spend_tool(
+    tool_name: str, paid_tools: dict, spend_tools, allowed_tools
+) -> bool:
+    """True when arg-key amounts on this tool count as money.
+
+    A tool qualifies when the owner listed it — in ``paid_tools``,
+    ``spend_tools`` or the policy's ``allowed_tools`` — or its name leads
+    with a spend verb (see :func:`_has_spend_hint`). Every other tool's
+    ``amount`` / ``value`` / ``price`` / ... arguments are its own
+    business (scroll distances, form values, quantities), never a spend.
+    """
+    return (
+        tool_name in paid_tools
+        or tool_name in spend_tools
+        or tool_name in allowed_tools
+        or _has_spend_hint(tool_name)
+    )
 
 # ---------------------------------------------------------------------------
 # Script / command inspection ("script gate")
@@ -215,11 +258,25 @@ def _to_cents(value) -> int | None:
 
 
 def extract_spend(
-    tool_name: str, args: dict, paid_tools: dict, gate_scripts: bool = True
+    tool_name: str,
+    args: dict,
+    paid_tools: dict,
+    gate_scripts: bool = True,
+    spend_tools=None,
+    allowed_tools=None,
 ) -> SpendAction | None:
-    """Return a SpendAction if this tool call spends money, else None."""
+    """Return a SpendAction if this tool call spends money, else None.
+
+    Arg-key amounts are only read on spend tools (see
+    :func:`_is_spend_tool`); on any other tool an ``amount`` / ``value``
+    argument — numeric or not — is never treated as money and never
+    blocked. The script gate below is separate: it inspects command text
+    on any tool, exactly as before.
+    """
     if not isinstance(args, dict):
         args = {}
+    spend_tools = spend_tools or ()
+    allowed_tools = allowed_tools or ()
 
     recipient = ""
     for key in RECIPIENT_KEYS:
@@ -228,17 +285,20 @@ def extract_spend(
             recipient = v.strip()
             break
 
-    for key in AMOUNT_CENTS_KEYS:
-        if key in args and args[key] is not None:
-            try:
-                return SpendAction(tool_name, recipient, int(args[key]))
-            except (TypeError, ValueError):
-                return SpendAction(tool_name, recipient, 0)
+    spend_tool = _is_spend_tool(tool_name, paid_tools, spend_tools, allowed_tools)
 
-    for key in AMOUNT_USD_KEYS:
-        if key in args and args[key] is not None:
-            cents = _to_cents(args[key])
-            return SpendAction(tool_name, recipient, cents if cents is not None else 0)
+    if spend_tool:
+        for key in AMOUNT_CENTS_KEYS:
+            if key in args and args[key] is not None:
+                try:
+                    return SpendAction(tool_name, recipient, int(args[key]))
+                except (TypeError, ValueError):
+                    return SpendAction(tool_name, recipient, 0)
+
+        for key in AMOUNT_USD_KEYS:
+            if key in args and args[key] is not None:
+                cents = _to_cents(args[key])
+                return SpendAction(tool_name, recipient, cents if cents is not None else 0)
 
     if tool_name in paid_tools:
         # Fixed-price tool: the tool itself is the counterparty when the
@@ -254,11 +314,13 @@ def extract_spend(
         if command_action is not None:
             return command_action
 
-    lowered = tool_name.lower()
-    if any(hint in lowered for hint in SPEND_TOOL_HINTS):
+    if tool_name in spend_tools or _has_spend_hint(tool_name):
         # Spend-shaped but unpriced: the guard cannot clear it, so it is
         # evaluated as a zero-amount action whose allowlist/amount checks
         # fail closed in evaluate_call below (see _unpriced flag handling).
+        # The hint test is whole-segment (see _has_spend_hint): display
+        # and utility tools whose names merely contain a hint substring
+        # or carry it as a noun (show_tip, tooltips) never land here.
         action = SpendAction(tool_name, recipient, 0)
         action.unpriced = True  # type: ignore[attr-defined]
         return action
@@ -289,10 +351,16 @@ class SpendGuard:
         paid_tools: dict | None = None,
         clock=None,
         gate_scripts: bool = True,
+        spend_tools=None,
     ):
         self.policy = policy
         self.storage = storage
         self.paid_tools = paid_tools or {}
+        # Owner-declared spend tools: arg-key amounts on these tools count
+        # as money even when the name carries no spend verb (see
+        # _is_spend_tool). Together with paid_tools and the policy's
+        # allowed_tools, this is the scope of arg-based spend detection.
+        self.spend_tools = list(spend_tools or [])
         # Script gate: inspect command/script text for spends (see
         # _extract_command_spend). Owners can turn it off in config.
         self.gate_scripts = bool(gate_scripts)
@@ -317,7 +385,12 @@ class SpendGuard:
         """Record an executed spend (called from post_tool_call: the tool
         actually ran, so the money actually moved)."""
         action = extract_spend(
-            tool_name, args, self.paid_tools, gate_scripts=self.gate_scripts
+            tool_name,
+            args,
+            self.paid_tools,
+            gate_scripts=self.gate_scripts,
+            spend_tools=self.spend_tools,
+            allowed_tools=self.policy.allowed_tools,
         )
         if action is None or action.amount_cents <= 0:
             return
@@ -339,7 +412,12 @@ class SpendGuard:
         is not a spend and the guard has no opinion on it.
         """
         action = extract_spend(
-            tool_name, args, self.paid_tools, gate_scripts=self.gate_scripts
+            tool_name,
+            args,
+            self.paid_tools,
+            gate_scripts=self.gate_scripts,
+            spend_tools=self.spend_tools,
+            allowed_tools=self.policy.allowed_tools,
         )
         if action is None:
             return None, None
