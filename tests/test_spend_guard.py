@@ -16,12 +16,13 @@ from policy import BLOCK, WARN, GuardPolicy, SpendAction, evaluate  # noqa: E402
 FIXED_NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
 
 
-def make_guard(policy=None, storage=None, paid_tools=None):
+def make_guard(policy=None, storage=None, paid_tools=None, gate_scripts=True):
     return SpendGuard(
         policy or GuardPolicy(),
         storage if storage is not None else DictStorage(),
         paid_tools=paid_tools or {},
         clock=lambda: FIXED_NOW,
+        gate_scripts=gate_scripts,
     )
 
 
@@ -158,6 +159,102 @@ class GuardAdapterTests(unittest.TestCase):
         self.assertEqual(directive["action"], "block")
         # post_tool_call never fires for a vetoed call, so nothing records.
         self.assertEqual(guard.spent_today_cents(), 0)
+
+
+class ScriptGateTests(unittest.TestCase):
+    """Spends written into shell commands / scripts (the `terminal` tool
+    passes its command as {"command": ...}) are inspected too."""
+
+    def test_script_priced_spend_over_cap_blocked(self):
+        guard = make_guard()
+        args = {
+            "command": "curl -s https://api.stripe.com/v1/charges "
+            "-d '{\"amount_usd\": 500}'"
+        }
+        action = extract_spend("terminal", args, {})
+        self.assertEqual(action.amount_cents, 50000)
+        self.assertEqual(action.recipient, "api.stripe.com")
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertEqual(directive["action"], "block")
+        self.assertEqual(ev.verdict, BLOCK)
+
+    def test_script_dollar_literal_priced(self):
+        action = extract_spend("terminal", {"command": "bash pay.sh $500"}, {})
+        self.assertEqual(action.amount_cents, 50000)
+
+    def test_script_currency_suffix_priced(self):
+        action = extract_spend(
+            "terminal", {"command": "python swap_tokens.py 100 USDT"}, {}
+        )
+        self.assertEqual(action.amount_cents, 10000)
+
+    def test_script_spend_verb_no_amount_routes_to_owner(self):
+        guard = make_guard()
+        args = {
+            "command": "curl -X POST https://api.stripe.com/v1/charges "
+            "-d customer=cus_123"
+        }
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(ev.verdict, WARN)
+        # The owner is told WHY the gate fired: detection was in the text.
+        self.assertIn("command/script text", directive["message"])
+
+    def test_frozen_blocks_script_spends(self):
+        guard = make_guard(GuardPolicy(frozen=True))
+        directive, _ev = guard.evaluate_call(
+            "terminal", {"command": "curl -X POST https://api.stripe.com/v1/charges"}
+        )
+        self.assertEqual(directive["action"], "block")
+        directive, _ev = guard.evaluate_call(
+            "terminal", {"command": "bash pay.sh $500"}
+        )
+        self.assertEqual(directive["action"], "block")
+
+    def test_script_priced_spend_within_caps_allowed_and_ledgered(self):
+        guard = make_guard()
+        args = {"command": "python3 send_invoice.py --amount 5"}
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertIsNone(directive)
+        self.assertEqual(ev.verdict, "allow")
+        guard.record_execution("terminal", args)
+        self.assertEqual(guard.spent_today_cents(), 500)
+
+    def test_benign_commands_have_no_opinion(self):
+        guard = make_guard()
+        benign = [
+            "ls -la",
+            "git status",
+            "npm test",
+            "cat README.md",
+            "python train.py",
+            "echo hello",
+            "awk '{print $1}' data.csv",  # $1 is a field ref, not money
+            "grep -r payload src/",  # 'pay' inside a word is not a verb
+            "curl https://docs.example.com/guide",  # plain docs fetch
+        ]
+        for cmd in benign:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(extract_spend("terminal", {"command": cmd}, {}))
+                directive, ev = guard.evaluate_call("terminal", {"command": cmd})
+                self.assertIsNone(directive)
+                self.assertIsNone(ev)
+
+    def test_gate_scripts_disabled_passes_script_spends(self):
+        guard = make_guard(gate_scripts=False)
+        args = {"command": "bash pay.sh $500"}
+        self.assertIsNone(extract_spend("terminal", args, {}, gate_scripts=False))
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertIsNone(directive)
+        self.assertIsNone(ev)
+
+    def test_script_gate_applies_regardless_of_tool_name(self):
+        # Any tool that smuggles a command string gets inspected, and the
+        # other command-text keys are recognised too.
+        action = extract_spend(
+            "run_notebook_cell", {"code": "charge_card(amount=30)"}, {}
+        )
+        self.assertEqual(action.amount_cents, 3000)
 
 
 if __name__ == "__main__":

@@ -80,7 +80,12 @@ def _build_guard(ctx) -> SpendGuard:
         storage = _CtxStateStorage(ctx.state)
     except Exception:
         storage = DictStorage()
-    return SpendGuard(policy, storage, paid_tools=paid_tools)
+    return SpendGuard(
+        policy,
+        storage,
+        paid_tools=paid_tools,
+        gate_scripts=bool(get("gate_scripts", default=True)),
+    )
 
 
 # ---------------------------------------------------------------- hooks
@@ -100,7 +105,12 @@ def _on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs):
             from guard import extract_spend
 
         try:
-            if extract_spend(tool_name, args or {}, _guard.paid_tools) is not None:
+            if extract_spend(
+                tool_name,
+                args or {},
+                _guard.paid_tools,
+                gate_scripts=getattr(_guard, "gate_scripts", True),
+            ) is not None:
                 return {
                     "action": "block",
                     "message": "Aegis Spend Guard could not evaluate this spend; "
@@ -164,6 +174,7 @@ def _tool_spend_guard_status(args: dict | None = None, **kwargs) -> str:
             "blocklist": p.blocklist,
             "allowed_tools": p.allowed_tools,
             "unknown_recipient": p.unknown_recipient,
+            "gate_scripts": _guard.gate_scripts,
         }
     )
 
