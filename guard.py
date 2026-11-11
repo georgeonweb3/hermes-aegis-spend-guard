@@ -16,8 +16,10 @@ Responsibilities:
     - a fixed per-call price from the owner's ``paid_tools`` map, or
     - a spend written into command/script text (a ``command`` / ``cmd`` /
       ``script`` / ``code`` argument — e.g. a ``terminal`` call): a money
-      literal in the text prices the spend; a payment verb with no
-      readable amount makes it an *unpriced* spend, routed to the owner.
+      literal prices the spend ONLY when a payment verb also appears in
+      the same text; a payment verb with no readable (positive) amount
+      makes it an *unpriced* spend, routed to the owner. A bare
+      ``$<digits>`` integer is never money (shell field reference).
       This inspection is the ``gate_scripts`` option (default on), or
     - a spend-shaped tool name (pay/transfer/purchase/...) with no readable
       amount — treated as an *unpriced spend* and routed to the owner,
@@ -123,34 +125,48 @@ def _is_spend_tool(
 # ``code``. A spend smuggled into such a call is invisible to the arg-key
 # checks above, so the command text itself is scanned:
 #
-# * a money literal prices the spend (normal caps/lists/ledger apply);
+# * a money literal prices the spend, but ONLY when a payment verb
+#   also appears in the same text (a bare `total = 0` in code is an
+#   assignment, not a spend — the maintainer's Nov 11 review case);
 # * a payment verb with no readable amount is an *unpriced* spend and is
 #   routed to the owner, exactly like an unpriced spend-shaped tool call.
+#   A zero (or negative) parsed amount in command text is never BLOCKED:
+#   with a verb it routes to the owner as unpriced, without one it is
+#   no opinion at all.
 #
 # Matching is word-boundary based so everyday text does not trip it
-# ("payload" is not "pay"). Posture is fail-closed: a verb found inside a
-# quoted grep pattern will gate to the owner rather than sail through —
-# see the README's "Script and command inspection" section. One deliberate
-# exception: a bare $1-$9 integer is NOT read as a money literal, because
-# $1..$9 are shell field/positional references (awk '{print $1}'); a spend
-# verb in the same command still gates it to the owner.
+# ("payload" is not "pay"). The verb list is deliberately narrow:
+# `send`, `tip`, `charge` and `subscribe` are out — `sock.send(...)`,
+# `git send-email` and pub/sub code are ordinary programming, not spends.
+# Posture is fail-closed: a kept verb found inside a quoted grep pattern
+# will gate to the owner rather than sail through — see the README's
+# "Script and command inspection" section. One deliberate exception: a
+# bare `$<digits>` integer is NEVER read as a money literal in shell
+# text, because `$12` is an awk field reference; only decimals
+# (`$12.50`), thousands-separated (`$1,000`) and USD-suffixed literals
+# (`100 USDT`) count as money.
 
 COMMAND_TEXT_KEYS = ("command", "cmd", "script", "code")
 
 _SPEND_TEXT_RE = re.compile(
     r"\b(?:pay|paid|paying|payments?|transfers?|purchases?|buy|buying|"
-    r"checkout|charges?|charged|sends?|sending|swaps?|withdraws?|"
-    r"withdrawals?|tips?|donates?|donations?|subscribes?|subscriptions?)\b",
+    r"checkout|swaps?|withdraws?|withdrawals?|donates?|donations?)\b",
     re.IGNORECASE,
 )
 # Explicit amount semantics in text: amount=500, amount: 500, --amount 500,
-# "amount_usd": 500. Any value counts — the key itself declares the amount.
+# "amount_usd": 500. The key must be followed by an explicit separator
+# (=, :, or whitespace for a --flag/value form) and a value — a bare
+# key with no separator is code, not a spend declaration.
 _MONEY_KV_RE = re.compile(
-    r"(?:amount_usd|amount|cost|price|total)\b[\"']?\s*[:=]?\s*[\"']?"
+    r"(?:amount_usd|amount|cost|price|total)\b[\"']?\s*(?:[:=]|\s+)\s*[\"']?"
     r"\$?\s*(\d[\d,]*(?:\.\d{1,2})?)",
     re.IGNORECASE,
 )
-_MONEY_DOLLAR_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d{1,2})?)")
+# A $ literal is money ONLY with a decimal point or a thousands
+# separator: $12.50, $1,000. A bare $12 is a shell field reference.
+_MONEY_DOLLAR_RE = re.compile(
+    r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d[\d,]*\.\d{1,2})"
+)
 _MONEY_SUFFIX_RE = re.compile(
     r"(\d[\d,]*(?:\.\d{1,2})?)\s*(?:USD|USDT|USDC)\b", re.IGNORECASE
 )
@@ -160,21 +176,6 @@ _RECIPIENT_KV_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_HOST_RE = re.compile(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
-
-
-def _plausible_money_literal(raw: str) -> bool:
-    """True if a $/suffix literal reads as money rather than shell syntax.
-
-    Bare integers under $10 are ignored: ``$1`` .. ``$9`` are awk field
-    references and positional parameters, not prices. A decimal point or
-    a thousands separator always reads as money.
-    """
-    if "." in raw or "," in raw:
-        return True
-    try:
-        return int(raw) >= 10
-    except ValueError:
-        return False
 
 
 def _command_text(args: dict) -> str:
@@ -191,6 +192,9 @@ def _money_literal_cents(text: str) -> int | None:
 
     USDT/USDC literals are treated at par with USD. Explicit key=value
     amounts win over bare literals (they declare their own semantics).
+    A bare `$<digits>` integer is never money (shell field reference),
+    so the dollar pattern only matches decimals / thousands-separated
+    literals — see ``_MONEY_DOLLAR_RE``.
     """
     m = _MONEY_KV_RE.search(text)
     if m:
@@ -199,10 +203,9 @@ def _money_literal_cents(text: str) -> int | None:
             return cents
     for pattern in (_MONEY_DOLLAR_RE, _MONEY_SUFFIX_RE):
         for m in pattern.finditer(text):
-            if _plausible_money_literal(m.group(1)):
-                cents = _to_cents(m.group(1).replace(",", ""))
-                if cents is not None:
-                    return cents
+            cents = _to_cents(m.group(1).replace(",", ""))
+            if cents is not None:
+                return cents
     return None
 
 
@@ -222,28 +225,32 @@ def _extract_command_spend(
 ) -> SpendAction | None:
     """Spend detection over command/script text (the script gate).
 
-    Priced when a money literal is readable; unpriced (owner gate) when a
-    payment verb appears without one; None when the text shows no spend
+    Priced only when a money literal AND a payment verb both appear in
+    the text; unpriced (owner gate) when a payment verb appears with no
+    readable amount, or with a zero/non-positive amount (a parsed 0 in
+    command text is never BLOCKED); None when the text shows no spend
     signals at all — benign shell use passes completely untouched.
     """
     text = _command_text(args)
     if not text:
         return None
+    has_verb = bool(_SPEND_TEXT_RE.search(text))
+    if not has_verb:
+        return None
     cents = _money_literal_cents(text)
-    if cents is not None:
+    if cents is not None and cents > 0:
         action = SpendAction(
             tool_name, recipient or _recipient_in_text(text), cents
         )
         action.in_script = True  # type: ignore[attr-defined]
         return action
-    if _SPEND_TEXT_RE.search(text):
-        action = SpendAction(
-            tool_name, recipient or _recipient_in_text(text), 0
-        )
-        action.unpriced = True  # type: ignore[attr-defined]
-        action.in_script = True  # type: ignore[attr-defined]
-        return action
-    return None
+    # Verb present but no positive amount: unpriced, routed to the owner.
+    action = SpendAction(
+        tool_name, recipient or _recipient_in_text(text), 0
+    )
+    action.unpriced = True  # type: ignore[attr-defined]
+    action.in_script = True  # type: ignore[attr-defined]
+    return action
 
 
 def _to_cents(value) -> int | None:

@@ -1,7 +1,5 @@
 # Aegis Spend Guard
 
-> **Status:** live and merged, including the script gate (Nov 10, 2026) — spends hidden inside shell commands are scanned, priced and capped too. Catalog PR: NousResearch/hermes-agent#151917.
-
 **Owner-set spend policy for Hermes Agent, enforced before any spend executes.**
 
 AI agents with paid tools can spend real money on their own initiative. Hermes
@@ -82,7 +80,8 @@ A tool call is a spend when any of these is true:
 4. The call carries command/script text (a `command` / `cmd` / `script` /
    `code` argument — how Hermes's `terminal` tool and code runners take
    their input) and the text itself shows a spend: a money literal prices
-   it, a payment verb without one makes it unpriced. See below. This is
+   it when a payment verb also appears in the same text, a payment verb
+   without a positive amount makes it unpriced. See below. This is
    the **script gate** (`gate_scripts`, on by default).
 
 The recipient is read from `recipient` / `counterparty` / `payee` / `to` /
@@ -100,15 +99,22 @@ command text) carries no amount argument, so arg-key checks alone would
 wave it through. With `gate_scripts` on (the default), the guard scans the
 command text of every call, whatever the tool is called:
 
-- **A money literal prices the spend.** `$500`, `$24.99`, `500 USD`,
+- **A money literal prices the spend — when a payment verb also appears
+  in the same text.** `$500.00`, `$24.99`, `500 USD`,
   `100 USDT`, `amount=500`, `--amount 500`, `"amount_usd": 500` — the
   first/clearest literal becomes the amount (USDT/USDC at par with USD),
   and the recipient is read from the text when one is obvious (a
-  `recipient=` style key, else the URL's host). Priced script spends go
+  `recipient=` style key, else the URL's host). A bare `$<digits>` integer
+  is never money (`$12` is an awk field reference, not a price), and an
+  amount key with no `=` / `:` / `--flag` separator is code, not a spend.
+  A zero amount in command text is never blocked: with a verb it routes
+  to the owner as unpriced. Priced script spends go
   through the full policy: per-tx cap, daily limit, allow/blocklists,
   freeze — and executed ones land in the daily ledger like any spend.
 - **A payment verb with no readable amount routes to the owner.** `pay`,
-  `transfer`, `charge`, `checkout`, `withdraw`, ... as whole words: the
+  `transfer`, `checkout`, `withdraw`, ... as whole words (the list is
+  deliberately narrow — `send`, `tip`, `charge` and `subscribe` are
+  ordinary programming words, not spends): the
   guard cannot price the spend, so — same fail-closed rule as unpriced
   tool calls — the launch goes to the owner's approval gate with a
   message saying the spend was detected in the command/script text.
@@ -116,11 +122,12 @@ command text of every call, whatever the tool is called:
 - **No spend signals, no opinion.** `ls`, `git status`, `npm test`,
   builds, doc fetches and the rest of everyday shell use pass completely
   untouched. Verb matching is word-boundary based (`payload` is not
-  `pay`), and a bare `$1`–`$9` is not read as money — those are shell
-  field/positional references (`awk '{print $1}'`).
+  `pay`), code amounts without a verb (`total = 0`, `price = 50`,
+  `python report.py --total 30`) are not spends, and bare `$<digits>`
+  integers are shell field references (`awk '{print $12}'`).
 
 The posture is deliberately fail-closed: a payment verb inside a quoted
-grep pattern (`grep -r "charge" src/`) will gate to the owner rather than
+grep pattern (`grep -r "pay" src/`) will gate to the owner rather than
 pass silently. Owners who would rather never gate shell use can set
 `gate_scripts: false`.
 
@@ -155,9 +162,9 @@ With the config above:
 | Pay `new-vendor.example` $5.00 | 🟡 routed to owner — not on allowlist |
 | Pay `suspicious-vendor.example` $1.00 | ⛔ blocked — blocklist |
 | Spends reach $96 today, then tries $10 more | ⛔ blocked — daily limit |
-| Runs `curl api.stripe.com/v1/charges -d '{"amount_usd": 500}'` | ⛔ blocked — $500 priced from the command text, over cap |
-| Runs `curl api.stripe.com/v1/charges` with no amount anywhere | 🟡 routed to owner — payment verb in script, unpriced |
-| Runs `git status`, `npm test`, `awk '{print $1}'` | ✅ allowed — no spend signals |
+| Runs `curl api.stripe.com/v1/payments -d '{"amount_usd": 500}'` | ⛔ blocked — $500 priced from the command text, over cap |
+| Runs `curl api.stripe.com/v1/payments` with no amount anywhere | 🟡 routed to owner — payment verb in script, unpriced |
+| Runs `git status`, `npm test`, `awk '{print $12}'` | ✅ allowed — no spend signals |
 | Anything, while frozen | ⛔ blocked |
 
 ## Disclosure

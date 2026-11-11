@@ -135,9 +135,9 @@ class HermesWiringTests(unittest.TestCase):
         self.assertIn('"spent_today_usd": 0.0', status)
 
     def test_script_gate_blocks_and_can_be_disabled(self):
-        # A $500 spend written into a terminal command is blocked...
+        # A $500.00 spend written into a terminal command is blocked...
         args = {
-            "command": "curl -s https://api.stripe.com/v1/charges "
+            "command": "curl -s https://api.stripe.com/v1/payments "
             "-d '{\"amount_usd\": 500}'"
         }
         pre = self.ctx.hooks["pre_tool_call"]

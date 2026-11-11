@@ -169,7 +169,7 @@ class ScriptGateTests(unittest.TestCase):
     def test_script_priced_spend_over_cap_blocked(self):
         guard = make_guard()
         args = {
-            "command": "curl -s https://api.stripe.com/v1/charges "
+            "command": "curl -s https://api.stripe.com/v1/payments "
             "-d '{\"amount_usd\": 500}'"
         }
         action = extract_spend("terminal", args, {})
@@ -180,19 +180,19 @@ class ScriptGateTests(unittest.TestCase):
         self.assertEqual(ev.verdict, BLOCK)
 
     def test_script_dollar_literal_priced(self):
-        action = extract_spend("terminal", {"command": "bash pay.sh $500"}, {})
+        action = extract_spend("terminal", {"command": "bash pay.sh $500.00"}, {})
         self.assertEqual(action.amount_cents, 50000)
 
     def test_script_currency_suffix_priced(self):
         action = extract_spend(
-            "terminal", {"command": "python swap_tokens.py 100 USDT"}, {}
+            "terminal", {"command": "python swap.py 100 USDT"}, {}
         )
         self.assertEqual(action.amount_cents, 10000)
 
     def test_script_spend_verb_no_amount_routes_to_owner(self):
         guard = make_guard()
         args = {
-            "command": "curl -X POST https://api.stripe.com/v1/charges "
+            "command": "curl -X POST https://api.stripe.com/v1/payments "
             "-d customer=cus_123"
         }
         directive, ev = guard.evaluate_call("terminal", args)
@@ -204,17 +204,17 @@ class ScriptGateTests(unittest.TestCase):
     def test_frozen_blocks_script_spends(self):
         guard = make_guard(GuardPolicy(frozen=True))
         directive, _ev = guard.evaluate_call(
-            "terminal", {"command": "curl -X POST https://api.stripe.com/v1/charges"}
+            "terminal", {"command": "curl -X POST https://api.stripe.com/v1/payments"}
         )
         self.assertEqual(directive["action"], "block")
         directive, _ev = guard.evaluate_call(
-            "terminal", {"command": "bash pay.sh $500"}
+            "terminal", {"command": "bash pay.sh $500.00"}
         )
         self.assertEqual(directive["action"], "block")
 
     def test_script_priced_spend_within_caps_allowed_and_ledgered(self):
         guard = make_guard()
-        args = {"command": "python3 send_invoice.py --amount 5"}
+        args = {"command": "python3 pay.py --amount 5"}
         directive, ev = guard.evaluate_call("terminal", args)
         self.assertIsNone(directive)
         self.assertEqual(ev.verdict, "allow")
@@ -231,6 +231,10 @@ class ScriptGateTests(unittest.TestCase):
             "python train.py",
             "echo hello",
             "awk '{print $1}' data.csv",  # $1 is a field ref, not money
+            "awk '{print $12}' data.csv",  # $12 is a field ref, not money
+            "sock.send(b'hello')",  # 'send' is ordinary code, not a spend
+            "git send-email --to team@example.com",  # same
+            "grep -r \"charge\" src/",  # 'charge' is ordinary code now
             "grep -r payload src/",  # 'pay' inside a word is not a verb
             "curl https://docs.example.com/guide",  # plain docs fetch
         ]
@@ -243,7 +247,7 @@ class ScriptGateTests(unittest.TestCase):
 
     def test_gate_scripts_disabled_passes_script_spends(self):
         guard = make_guard(gate_scripts=False)
-        args = {"command": "bash pay.sh $500"}
+        args = {"command": "bash pay.sh $500.00"}
         self.assertIsNone(extract_spend("terminal", args, {}, gate_scripts=False))
         directive, ev = guard.evaluate_call("terminal", args)
         self.assertIsNone(directive)
@@ -253,9 +257,68 @@ class ScriptGateTests(unittest.TestCase):
         # Any tool that smuggles a command string gets inspected, and the
         # other command-text keys are recognised too.
         action = extract_spend(
-            "run_notebook_cell", {"code": "charge_card(amount=30)"}, {}
+            "run_notebook_cell", {"code": "pay(amount=30)"}, {}
         )
         self.assertEqual(action.amount_cents, 3000)
+
+    def test_script_code_amounts_without_verb_have_no_opinion(self):
+        # Maintainer's Nov 11 review cases: ordinary code carrying an
+        # amount-shaped key is not a spend — no directive, no evaluation,
+        # nothing in the daily ledger.
+        guard = make_guard()
+        cases = [
+            ("execute_code", {"code": "total = 0"}),
+            ("execute_code", {"code": "price = 50"}),
+            ("terminal", {"command": "python report.py --total 30"}),
+        ]
+        for tool_name, args in cases:
+            with self.subTest(tool=tool_name, args=args):
+                self.assertIsNone(extract_spend(tool_name, args, {}))
+                directive, ev = guard.evaluate_call(tool_name, args)
+                self.assertIsNone(directive)
+                self.assertIsNone(ev)
+                guard.record_execution(tool_name, args)
+                self.assertEqual(guard.spent_today_cents(), 0)
+
+    def test_script_shell_dollar_field_refs_add_nothing_to_ledger(self):
+        # Maintainer's Nov 11 review case: awk '{print $12}' is a field
+        # reference, not $12 of spend — no opinion, ledger stays at 0.
+        guard = make_guard()
+        args = {"command": "awk '{print $12}' data.csv"}
+        self.assertIsNone(extract_spend("terminal", args, {}))
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertIsNone(directive)
+        self.assertIsNone(ev)
+        guard.record_execution("terminal", args)
+        self.assertEqual(guard.spent_today_cents(), 0)
+
+    def test_script_bare_dollar_integer_is_not_money(self):
+        # A bare $12 with a verb is unpriced (owner gate), never a $12
+        # priced spend; $12.50 in the same shape prices normally.
+        guard = make_guard()
+        action = extract_spend("terminal", {"command": "bash pay.sh $12"}, {})
+        self.assertTrue(getattr(action, "unpriced", False))
+        directive, ev = guard.evaluate_call(
+            "terminal", {"command": "bash pay.sh $12"}
+        )
+        self.assertEqual(directive["action"], "approve")
+        guard.record_execution("terminal", {"command": "bash pay.sh $12"})
+        self.assertEqual(guard.spent_today_cents(), 0)
+        action = extract_spend(
+            "terminal", {"command": "bash pay.sh $12.50"}, {}
+        )
+        self.assertEqual(action.amount_cents, 1250)
+
+    def test_script_zero_amount_with_verb_routes_to_owner_not_block(self):
+        # A parsed 0 in command text is never BLOCKED: with a verb it
+        # goes to the owner as unpriced.
+        guard = make_guard()
+        args = {"command": "pay invoice --total 0"}
+        directive, ev = guard.evaluate_call("terminal", args)
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(ev.verdict, WARN)
+        guard.record_execution("terminal", args)
+        self.assertEqual(guard.spent_today_cents(), 0)
 
 
 class SpendDetectionScopingTests(unittest.TestCase):
