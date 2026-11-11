@@ -112,14 +112,18 @@ command text of every call, whatever the tool is called:
   through the full policy: per-tx cap, daily limit, allow/blocklists,
   freeze — and executed ones land in the daily ledger like any spend.
 - **A payment verb with no readable amount routes to the owner.** `pay`,
-  `transfer`, `checkout`, `withdraw`, ... as whole words (the list is
+  `transfer`, `withdraw`, ... as whole words (the list is
   deliberately narrow — `send`, `tip`, `charge` and `subscribe` are
   ordinary programming words, not spends): the
   guard cannot price the spend, so — same fail-closed rule as unpriced
   tool calls — the launch goes to the owner's approval gate with a
   message saying the spend was detected in the command/script text.
   While frozen, script spends are blocked outright, priced or not.
-- **No spend signals, no opinion.** `ls`, `git status`, `npm test`,
+  `checkout` and `swap` are context verbs, not bare verbs: on their own
+  they are ordinary programming (`git checkout main`, swap files), and
+  only count when the same text also carries a money literal or a
+  recipient (`checkout $49.99`, `swap 100 USDT`).
+- **No spend signals, no opinion.** `ls`, `git status`, `git checkout main`, `npm test`,
   builds, doc fetches and the rest of everyday shell use pass completely
   untouched. Verb matching is word-boundary based (`payload` is not
   `pay`), code amounts without a verb (`total = 0`, `price = 50`,

@@ -234,6 +234,9 @@ class ScriptGateTests(unittest.TestCase):
             "awk '{print $12}' data.csv",  # $12 is a field ref, not money
             "sock.send(b'hello')",  # 'send' is ordinary code, not a spend
             "git send-email --to team@example.com",  # same
+            "git checkout main",  # 'checkout' alone is ordinary code
+            "git checkout -b feature/login",  # same
+            "python dedupe.py --swap-files",  # 'swap' in a flag is not a spend
             "grep -r \"charge\" src/",  # 'charge' is ordinary code now
             "grep -r payload src/",  # 'pay' inside a word is not a verb
             "curl https://docs.example.com/guide",  # plain docs fetch
@@ -244,6 +247,32 @@ class ScriptGateTests(unittest.TestCase):
                 directive, ev = guard.evaluate_call("terminal", {"command": cmd})
                 self.assertIsNone(directive)
                 self.assertIsNone(ev)
+
+    def test_script_checkout_and_swap_need_money_or_recipient(self):
+        # Maintainer's Nov 11 review, round 3: `checkout` and `swap(s)`
+        # are ordinary programming words on their own — `git checkout
+        # main` returns no directive, frozen or not — but they still gate
+        # when the same text prices the spend or names a recipient.
+        for frozen in (False, True):
+            guard = make_guard(GuardPolicy(frozen=frozen))
+            for cmd in ("git checkout main", "git checkout -b feature/x"):
+                with self.subTest(frozen=frozen, cmd=cmd):
+                    self.assertIsNone(extract_spend("terminal", {"command": cmd}, {}))
+                    directive, ev = guard.evaluate_call("terminal", {"command": cmd})
+                    self.assertIsNone(directive)
+                    self.assertIsNone(ev)
+        # Priced: a money literal alongside the context verb still gates.
+        action = extract_spend("terminal", {"command": "checkout $49.99"}, {})
+        self.assertEqual(action.amount_cents, 4999)
+        action = extract_spend("terminal", {"command": "swap 100 USDT"}, {})
+        self.assertEqual(action.amount_cents, 10000)
+        # Recipient but no amount: unpriced, routed to the owner.
+        guard = make_guard()
+        directive, ev = guard.evaluate_call(
+            "terminal", {"command": "checkout merchant=shop.example"}
+        )
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(ev.verdict, WARN)
 
     def test_gate_scripts_disabled_passes_script_spends(self):
         guard = make_guard(gate_scripts=False)

@@ -128,6 +128,9 @@ def _is_spend_tool(
 # * a money literal prices the spend, but ONLY when a payment verb
 #   also appears in the same text (a bare `total = 0` in code is an
 #   assignment, not a spend — the maintainer's Nov 11 review case);
+# * `checkout` and `swap(s)` are context verbs: they need a money
+#   literal or a recipient in the same text to count at all — `git
+#   checkout main` on its own is not a spend (round 3 of that review);
 # * a payment verb with no readable amount is an *unpriced* spend and is
 #   routed to the owner, exactly like an unpriced spend-shaped tool call.
 #   A zero (or negative) parsed amount in command text is never BLOCKED:
@@ -138,19 +141,31 @@ def _is_spend_tool(
 # ("payload" is not "pay"). The verb list is deliberately narrow:
 # `send`, `tip`, `charge` and `subscribe` are out — `sock.send(...)`,
 # `git send-email` and pub/sub code are ordinary programming, not spends.
-# Posture is fail-closed: a kept verb found inside a quoted grep pattern
-# will gate to the owner rather than sail through — see the README's
-# "Script and command inspection" section. One deliberate exception: a
-# bare `$<digits>` integer is NEVER read as a money literal in shell
-# text, because `$12` is an awk field reference; only decimals
-# (`$12.50`), thousands-separated (`$1,000`) and USD-suffixed literals
-# (`100 USDT`) count as money.
+# `checkout` and `swap(s)` are context verbs, not core verbs: `git
+# checkout main`, swap files and array swaps are ordinary programming
+# too, so on their own they are NOT spend signals — they only count when
+# the same text also carries a money literal or a recipient (maintainer's
+# Nov 11 review, round 3). Posture is fail-closed: a kept verb found
+# inside a quoted grep pattern will gate to the owner rather than sail
+# through — see the README's "Script and command inspection" section.
+# One deliberate exception: a bare `$<digits>` integer is NEVER read as
+# a money literal in shell text, because `$12` is an awk field reference;
+# only decimals (`$12.50`), thousands-separated (`$1,000`) and
+# USD-suffixed literals (`100 USDT`) count as money.
 
 COMMAND_TEXT_KEYS = ("command", "cmd", "script", "code")
 
 _SPEND_TEXT_RE = re.compile(
     r"\b(?:pay|paid|paying|payments?|transfers?|purchases?|buy|buying|"
-    r"checkout|swaps?|withdraws?|withdrawals?|donates?|donations?)\b",
+    r"withdraws?|withdrawals?|donates?|donations?)\b",
+    re.IGNORECASE,
+)
+# Context verbs: `checkout` and `swap(s)` only count as spend signals
+# when the same command text also carries a money literal or a recipient
+# — `checkout $49.99` and `swap 100 USDT` are still gated, while
+# `git checkout main` and swap files pass untouched.
+_SPEND_CONTEXT_RE = re.compile(
+    r"\b(?:checkout|swaps?)\b",
     re.IGNORECASE,
 )
 # Explicit amount semantics in text: amount=500, amount: 500, --amount 500,
@@ -230,23 +245,34 @@ def _extract_command_spend(
     readable amount, or with a zero/non-positive amount (a parsed 0 in
     command text is never BLOCKED); None when the text shows no spend
     signals at all — benign shell use passes completely untouched.
+    `checkout` and `swap(s)` are context verbs: on their own they are
+    ordinary programming (`git checkout main`), and only count when the
+    same text also carries a money literal or a recipient.
     """
     text = _command_text(args)
     if not text:
         return None
     has_verb = bool(_SPEND_TEXT_RE.search(text))
-    if not has_verb:
+    has_context_verb = bool(_SPEND_CONTEXT_RE.search(text))
+    if not has_verb and not has_context_verb:
         return None
     cents = _money_literal_cents(text)
+    recipient_in_text = recipient or _recipient_in_text(text)
+    if has_context_verb and not has_verb:
+        # A context verb alone is ordinary programming: it only counts
+        # as a spend when the text also prices it or names a recipient.
+        if cents is None or cents <= 0:
+            if not recipient_in_text:
+                return None
     if cents is not None and cents > 0:
         action = SpendAction(
-            tool_name, recipient or _recipient_in_text(text), cents
+            tool_name, recipient_in_text, cents
         )
         action.in_script = True  # type: ignore[attr-defined]
         return action
     # Verb present but no positive amount: unpriced, routed to the owner.
     action = SpendAction(
-        tool_name, recipient or _recipient_in_text(text), 0
+        tool_name, recipient_in_text, 0
     )
     action.unpriced = True  # type: ignore[attr-defined]
     action.in_script = True  # type: ignore[attr-defined]

@@ -1,5 +1,5 @@
 name: aegis-spend-guard
-version: 1.1.1
+version: 1.1.2
 description: "Owner-set spend policy for agent tool calls: per-transaction cap, daily limit, recipient allow/blocklists and a freeze switch, enforced in pre_tool_call before any spend executes — including spends written into shell commands and scripts the agent runs. Over-policy spends are blocked; borderline ones are routed to the owner through Hermes's approval gate."
 author: "George Agbe (@georgebuilding2)"
 provides_tools:
